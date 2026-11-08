@@ -29,17 +29,21 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
+#include <QParallelAnimationGroup>
 #include <QPixmap>
+#include <QPointer>
 #include <QProcess>
 #include <QProcessEnvironment>
 #include <QPropertyAnimation>
 #include <QPushButton>
 #include <QScreen>
+#include <QSequentialAnimationGroup>
 #include <QSettings>
 #include <QSpinBox>
 #include <QStandardPaths>
 #include <QStyle>
 #include <QSystemTrayIcon>
+#include <QTemporaryFile>
 #include <QTimer>
 #include <QUrl>
 #include <QVBoxLayout>
@@ -191,7 +195,8 @@ public:
         runGSettings({"set", baseSchema, "binding", gvariantBinding});
     }
 
-    // Folder inside ~/Pictures so Snap browsers (Firefox/Chromium) and Nautilus can read dragged files
+    // Dedicated temp storage inside ~/Pictures/.macshot_temp
+    // Accessible by Snap-confined browsers (Firefox/Chromium) & desktop file managers (Nautilus)
     static QString dragTempDir() {
         QString dirPath = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation) + "/.macshot_temp";
         QDir dir(dirPath);
@@ -199,6 +204,23 @@ public:
             dir.mkpath(".");
         }
         return dirPath;
+    }
+
+    // Deletes screenshots older than 24 hours (or from previous days) so the folder never piles up
+    static void cleanupOldTempScreenshots() {
+        QString dirPath = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation) + "/.macshot_temp";
+        QDir dir(dirPath);
+        if (!dir.exists()) return;
+
+        const QFileInfoList fileList = dir.entryInfoList({"*.png", "*.jpg", "*.webp"}, QDir::Files);
+        const QDateTime now = QDateTime::currentDateTime();
+
+        for (const QFileInfo& fi : fileList) {
+            // Delete if older than 24 hours (86400 seconds)
+            if (fi.lastModified().secsTo(now) > 86400) {
+                QFile::remove(fi.absoluteFilePath());
+            }
+        }
     }
 
 private:
@@ -576,23 +598,53 @@ private:
 };
 
 // ============================================================================
-// 3. macOS-Style Floating Corner Thumbnail (Safe Click & Drag-and-Drop)
+// 3. Screen Flash Shutter Overlay (macOS Camera Shutter Flash Animation)
+// ============================================================================
+class ScreenFlashOverlay : public QWidget {
+    Q_OBJECT
+public:
+    explicit ScreenFlashOverlay(const QRect& screenGeometry, QWidget* parent = nullptr)
+        : QWidget(parent,
+                  Qt::Tool | Qt::FramelessWindowHint |
+                  Qt::WindowStaysOnTopHint | Qt::WindowTransparentForInput |
+                  Qt::X11BypassWindowManagerHint) {
+        setAttribute(Qt::WA_TranslucentBackground);
+        setAttribute(Qt::WA_DeleteOnClose);
+        setGeometry(screenGeometry);
+        show();
+
+        auto* anim = new QPropertyAnimation(this, "windowOpacity", this);
+        anim->setDuration(240);
+        anim->setStartValue(0.75);
+        anim->setEndValue(0.0);
+        anim->setEasingCurve(QEasingCurve::OutQuad);
+        connect(anim, &QPropertyAnimation::finished, this, &QWidget::close);
+        anim->start(QAbstractAnimation::DeleteWhenStopped);
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter p(this);
+        p.fillRect(rect(), Qt::white);
+    }
+};
+
+// ============================================================================
+// 4. macOS-Style Floating Corner Thumbnail (Multi-Screenshot Stack & Drag-and-Drop)
 // ============================================================================
 class FloatingThumbnail : public QWidget {
     Q_OBJECT
+    Q_PROPERTY(qreal scaleFactor READ scaleFactor WRITE setScaleFactor)
 public:
-    explicit FloatingThumbnail(const QPixmap& pixmap, QWidget* parent = nullptr)
+    explicit FloatingThumbnail(const QPixmap& pixmap, const QRect& originRect = QRect(), QWidget* parent = nullptr)
         : QWidget(parent, Qt::Tool | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint),
-          m_pixmap(pixmap) {
+          m_originRect(originRect) {
         setAttribute(Qt::WA_TranslucentBackground);
         setAttribute(Qt::WA_DeleteOnClose);
         setCursor(Qt::PointingHandCursor);
-        setFixedSize(240, 160);
+        setFixedSize(260, 180);
 
-        // Save inside ~/Pictures/.macshot_temp so Snap browsers (Firefox/Chrome) & Nautilus can access it
-        m_tempFilePath = SettingsManager::dragTempDir() + "/Screenshot_"
-            + QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss_zzz") + ".png";
-        m_pixmap.save(m_tempFilePath, "PNG");
+        addScreenshotItem(pixmap);
 
         m_dismissTimer = new QTimer(this);
         m_dismissTimer->setSingleShot(true);
@@ -602,16 +654,82 @@ public:
         positionInCorner();
     }
 
+    void addScreenshot(const QPixmap& pixmap, const QRect& originRect = QRect()) {
+        addScreenshotItem(pixmap);
+        m_originRect = originRect;
+
+        // Reset timer on each new screenshot
+        m_dismissTimer->stop();
+        m_dismissTimer->start(SettingsManager::dismissSeconds() * 1000);
+
+        // Animate stack bump / pulse
+        auto* pulse = new QPropertyAnimation(this, "scaleFactor", this);
+        pulse->setDuration(240);
+        pulse->setStartValue(1.12);
+        pulse->setEndValue(1.0);
+        pulse->setEasingCurve(QEasingCurve::OutBack);
+        pulse->start(QAbstractAnimation::DeleteWhenStopped);
+
+        update();
+    }
+
+    qreal scaleFactor() const { return m_scaleFactor; }
+    void setScaleFactor(qreal factor) {
+        m_scaleFactor = factor;
+        update();
+    }
+
+private:
+    void addScreenshotItem(const QPixmap& pixmap) {
+        m_stack.append(pixmap);
+
+        // Save inside ~/Pictures/.macshot_temp so Snap browsers (Firefox/Chromium) & Nautilus can access the file!
+        QString filePath = SettingsManager::dragTempDir() + "/Screenshot_"
+            + QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss_zzz")
+            + "_" + QString::number(m_stack.size()) + ".png";
+        pixmap.save(filePath, "PNG");
+        m_filePaths.append(filePath);
+    }
+
 protected:
     void paintEvent(QPaintEvent*) override {
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing);
         p.setRenderHint(QPainter::SmoothPixmapTransform);
 
-        QRectF cardRect = rect().adjusted(10, 10, -10, -10);
-        QPainterPath path;
-        path.addRoundedRect(cardRect, 12, 12);
-        p.fillPath(path, QColor(30, 30, 30, 235));
+        if (m_scaleFactor < 0.999 || m_scaleFactor > 1.001) {
+            p.translate(width() / 2.0, height() / 2.0);
+            p.scale(m_scaleFactor, m_scaleFactor);
+            p.translate(-width() / 2.0, -height() / 2.0);
+        }
+
+        int count = m_stack.size();
+
+        // 1. If 3 or more images, draw back card
+        if (count >= 3) {
+            QRectF backRect(26, 6, 216, 140);
+            QPainterPath backPath;
+            backPath.addRoundedRect(backRect, 12, 12);
+            p.fillPath(backPath, QColor(45, 45, 45, 170));
+            p.setPen(QPen(QColor(255, 255, 255, 40), 1.0));
+            p.drawRoundedRect(backRect, 12, 12);
+        }
+
+        // 2. If 2 or more images, draw middle card
+        if (count >= 2) {
+            QRectF midRect(18, 12, 224, 146);
+            QPainterPath midPath;
+            midPath.addRoundedRect(midRect, 12, 12);
+            p.fillPath(midPath, QColor(38, 38, 38, 210));
+            p.setPen(QPen(QColor(255, 255, 255, 60), 1.0));
+            p.drawRoundedRect(midRect, 12, 12);
+        }
+
+        // 3. Front card (most recent screenshot)
+        QRectF cardRect(10, 18, 232, 150);
+        QPainterPath frontPath;
+        frontPath.addRoundedRect(cardRect, 12, 12);
+        p.fillPath(frontPath, QColor(28, 28, 28, 240));
 
         p.save();
         QRectF innerRect = cardRect.adjusted(6, 6, -6, -6);
@@ -619,7 +737,8 @@ protected:
         clipPath.addRoundedRect(innerRect, 8, 8);
         p.setClipPath(clipPath);
 
-        QPixmap scaled = m_pixmap.scaled(innerRect.size().toSize(), Qt::KeepAspectRatio, Qt::SmoothTransformation);
+        const QPixmap& frontPix = m_stack.last();
+        QPixmap scaled = frontPix.scaled(innerRect.size().toSize(), Qt::KeepAspectRatio, Qt::SmoothTransformation);
         QPointF pos(
             innerRect.x() + (innerRect.width() - scaled.width()) / 2.0,
             innerRect.y() + (innerRect.height() - scaled.height()) / 2.0
@@ -627,8 +746,23 @@ protected:
         p.drawPixmap(pos, scaled);
         p.restore();
 
-        p.setPen(QPen(QColor(255, 255, 255, 90), 1.5));
+        p.setPen(QPen(QColor(255, 255, 255, 100), 1.5));
         p.drawRoundedRect(cardRect, 12, 12);
+
+        // 4. Badge indicator for stacked screenshots
+        if (count > 1) {
+            QString badgeText = QString::number(count);
+            QRectF badgeRect(cardRect.right() - 26, cardRect.top() - 6, 24, 24);
+            p.setPen(Qt::NoPen);
+            p.setBrush(QColor(0, 122, 255)); // macOS accent blue
+            p.drawEllipse(badgeRect);
+            p.setPen(Qt::white);
+            QFont f = p.font();
+            f.setBold(true);
+            f.setPixelSize(11);
+            p.setFont(f);
+            p.drawText(badgeRect, Qt::AlignCenter, badgeText);
+        }
     }
 
     void enterEvent(QEnterEvent*) override {
@@ -638,7 +772,6 @@ protected:
     }
 
     void leaveEvent(QEvent*) override {
-        // Do NOT restart timer if we are dragging or opening the editor dialog
         if (!m_dragging && !m_closing) {
             m_dismissTimer->start(2500);
         }
@@ -656,7 +789,7 @@ protected:
     }
 
     void mouseMoveEvent(QMouseEvent* event) override {
-        if (!(event->buttons() & Qt::LeftButton) || m_dragging || m_closing) return;
+        if (!(event->buttons() & Qt::LeftButton) || m_dragging || m_closing || m_stack.isEmpty()) return;
         if ((event->pos() - m_pressPos).manhattanLength() < QApplication::startDragDistance()) return;
 
         m_dragging = true;
@@ -665,23 +798,30 @@ protected:
         auto* drag = new QDrag(this);
         auto* mime = new QMimeData();
 
-        // 1. Local file URI first (Nautilus folders, browser file inputs, Discord, Slack)
-        mime->setUrls({QUrl::fromLocalFile(m_tempFilePath)});
+        // 1. URLs from accessible ~/Pictures/.macshot_temp directory
+        // This allows Snap applications (Firefox, Chromium) and Nautilus to read the dropped files!
+        QList<QUrl> urls;
+        for (const QString& path : m_filePaths) {
+            urls.append(QUrl::fromLocalFile(path));
+        }
+        if (!urls.isEmpty()) {
+            mime->setUrls(urls);
+        }
 
         // 2. PNG bytes and QImage data for rich-text editors
+        const QPixmap& frontPix = m_stack.last();
         QByteArray pngBytes;
         QBuffer buffer(&pngBytes);
         buffer.open(QIODevice::WriteOnly);
-        m_pixmap.save(&buffer, "PNG");
+        frontPix.save(&buffer, "PNG");
         mime->setData("image/png", pngBytes);
-        mime->setImageData(m_pixmap.toImage());
+        mime->setImageData(frontPix.toImage());
 
         drag->setMimeData(mime);
-        QPixmap dragThumb = m_pixmap.scaled(120, 90, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+        QPixmap dragThumb = frontPix.scaled(120, 90, Qt::KeepAspectRatio, Qt::SmoothTransformation);
         drag->setPixmap(dragThumb);
         drag->setHotSpot(QPoint(dragThumb.width() / 2, dragThumb.height() / 2));
 
-        // IMPORTANT: Keep window mapped during drag->exec() so X11/Wayland keeps the pointer grab!
         setWindowOpacity(0.25);
         Qt::DropAction dropResult = drag->exec(Qt::CopyAction | Qt::MoveAction, Qt::CopyAction);
 
@@ -689,7 +829,6 @@ protected:
             m_closing = true;
             close();
         } else {
-            // User cancelled drag (e.g. Esc) — keep thumbnail alive
             m_dragging = false;
             setWindowOpacity(1.0);
             m_dismissTimer->start(3000);
@@ -697,16 +836,18 @@ protected:
     }
 
     void mouseReleaseEvent(QMouseEvent* event) override {
-        if (event->button() == Qt::LeftButton && !m_dragging && !m_closing) {
+        if (event->button() == Qt::LeftButton && !m_dragging && !m_closing && !m_stack.isEmpty()) {
             m_closing = true;
             m_dismissTimer->stop();
 
-            // Open PreviewEditorDialog asynchronously on the heap so closing it never touches a freed 'this'
-            auto* dlg = new PreviewEditorDialog(m_pixmap);
-            dlg->setAttribute(Qt::WA_DeleteOnClose);
-            dlg->show();
-            dlg->raise();
-            dlg->activateWindow();
+            // Open editor for each screenshot in the stack
+            for (const QPixmap& pix : m_stack) {
+                auto* dlg = new PreviewEditorDialog(pix);
+                dlg->setAttribute(Qt::WA_DeleteOnClose);
+                dlg->show();
+                dlg->raise();
+                dlg->activateWindow();
+            }
 
             close();
         }
@@ -714,7 +855,8 @@ protected:
 
 private:
     void positionInCorner() {
-        QScreen* scr = QGuiApplication::primaryScreen();
+        QScreen* scr = QGuiApplication::screenAt(QCursor::pos());
+        if (!scr) scr = QGuiApplication::primaryScreen();
         QRect avail = scr ? scr->availableGeometry() : QRect(0, 0, 1920, 1080);
         const int margin = 20;
 
@@ -734,16 +876,42 @@ private:
                 break;
         }
 
-        QPoint startPos = targetPos + QPoint((targetPos.x() > avail.center().x()) ? 60 : -60, 0);
+        QPoint startPos;
+        if (m_originRect.isValid() && m_originRect.width() > 10 && m_originRect.height() > 10) {
+            startPos = m_originRect.center() - QPoint(width() / 2, height() / 2);
+        } else {
+            startPos = targetPos + QPoint((targetPos.x() > avail.center().x()) ? 120 : -120, 40);
+        }
+
         move(startPos);
+        setWindowOpacity(0.0);
+        m_scaleFactor = 0.55;
         show();
 
-        auto* anim = new QPropertyAnimation(this, "pos", this);
-        anim->setDuration(220);
-        anim->setStartValue(startPos);
-        anim->setEndValue(targetPos);
-        anim->setEasingCurve(QEasingCurve::OutCubic);
-        anim->start(QAbstractAnimation::DeleteWhenStopped);
+        auto* animGroup = new QParallelAnimationGroup(this);
+
+        auto* posAnim = new QPropertyAnimation(this, "pos", animGroup);
+        posAnim->setDuration(320);
+        posAnim->setStartValue(startPos);
+        posAnim->setEndValue(targetPos);
+        posAnim->setEasingCurve(QEasingCurve::OutCubic);
+        animGroup->addAnimation(posAnim);
+
+        auto* opacityAnim = new QPropertyAnimation(this, "windowOpacity", animGroup);
+        opacityAnim->setDuration(240);
+        opacityAnim->setStartValue(0.0);
+        opacityAnim->setEndValue(1.0);
+        opacityAnim->setEasingCurve(QEasingCurve::OutQuad);
+        animGroup->addAnimation(opacityAnim);
+
+        auto* scaleAnim = new QPropertyAnimation(this, "scaleFactor", animGroup);
+        scaleAnim->setDuration(320);
+        scaleAnim->setStartValue(0.55);
+        scaleAnim->setEndValue(1.0);
+        scaleAnim->setEasingCurve(QEasingCurve::OutBack);
+        animGroup->addAnimation(scaleAnim);
+
+        animGroup->start(QAbstractAnimation::DeleteWhenStopped);
     }
 
     void animateOutAndClose() {
@@ -757,8 +925,10 @@ private:
         fade->start(QAbstractAnimation::DeleteWhenStopped);
     }
 
-    QPixmap m_pixmap;
-    QString m_tempFilePath;
+    QList<QPixmap> m_stack;
+    QStringList m_filePaths;
+    QRect m_originRect;
+    qreal m_scaleFactor = 1.0;
     QTimer* m_dismissTimer = nullptr;
     QPoint m_pressPos;
     bool m_dragging = false;
@@ -803,7 +973,7 @@ public:
     }
 
 signals:
-    void regionCaptured(const QPixmap& captured);
+    void regionCaptured(const QPixmap& captured, const QRect& globalOriginRect);
 
 protected:
     void paintEvent(QPaintEvent*) override {
@@ -866,7 +1036,9 @@ protected:
             releaseMouse();
             close();
             if (norm.width() > 5 && norm.height() > 5) {
-                emit regionCaptured(m_desktopPixmap.copy(norm));
+                QRect globalRect = norm.translated(m_virtualGeo.topLeft());
+                new ScreenFlashOverlay(globalRect);
+                emit regionCaptured(m_desktopPixmap.copy(norm), globalRect);
             }
         }
     }
@@ -883,12 +1055,14 @@ protected:
 
             // Shift+Enter captures all monitors; Enter captures the monitor under the cursor
             if (event->modifiers() & Qt::ShiftModifier) {
-                emit regionCaptured(m_desktopPixmap);
+                new ScreenFlashOverlay(m_virtualGeo);
+                emit regionCaptured(m_desktopPixmap, m_virtualGeo);
             } else {
                 QScreen* activeScreen = QGuiApplication::screenAt(QCursor::pos());
                 if (!activeScreen) activeScreen = QGuiApplication::primaryScreen();
                 QRect screenLocal = activeScreen->geometry().translated(-m_virtualGeo.topLeft());
-                emit regionCaptured(m_desktopPixmap.copy(screenLocal));
+                new ScreenFlashOverlay(activeScreen->geometry());
+                emit regionCaptured(m_desktopPixmap.copy(screenLocal), activeScreen->geometry());
             }
         }
     }
@@ -982,6 +1156,14 @@ public:
         setupSingleInstanceServer();
         setupTrayIcon();
         SettingsManager::registerUbuntuGlobalShortcut(SettingsManager::shortcut());
+        SettingsManager::cleanupOldTempScreenshots();
+
+        // Run cleanup every 4 hours so old screenshots (> 24 hours) from previous days are deleted
+        auto* cleanupTimer = new QTimer(this);
+        connect(cleanupTimer, &QTimer::timeout, this, []() {
+            SettingsManager::cleanupOldTempScreenshots();
+        });
+        cleanupTimer->start(4 * 3600 * 1000);
     }
 
 public slots:
@@ -1059,10 +1241,18 @@ private slots:
     }
 
 private:
-    void handleCapturedPixmap(const QPixmap& pixmap) {
+    void handleCapturedPixmap(const QPixmap& pixmap, const QRect& originRect = QRect()) {
         if (pixmap.isNull()) return;
         QApplication::clipboard()->setPixmap(pixmap);
-        new FloatingThumbnail(pixmap);
+
+        if (m_floatingThumbnail) {
+            m_floatingThumbnail->addScreenshot(pixmap, originRect);
+        } else {
+            m_floatingThumbnail = new FloatingThumbnail(pixmap, originRect);
+            connect(m_floatingThumbnail, &QObject::destroyed, this, [this]() {
+                m_floatingThumbnail = nullptr;
+            });
+        }
     }
 
     void captureViaPortal() {
@@ -1129,6 +1319,7 @@ private:
     QSystemTrayIcon* m_tray = nullptr;
     QLocalServer* m_ipcServer = nullptr;
     SettingsDialog* m_settingsDialog = nullptr;
+    QPointer<FloatingThumbnail> m_floatingThumbnail = nullptr;
 };
 
 // ============================================================================
